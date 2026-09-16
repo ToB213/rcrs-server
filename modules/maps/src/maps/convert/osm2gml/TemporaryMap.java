@@ -2,6 +2,7 @@ package maps.convert.osm2gml;
 
 import java.awt.geom.Rectangle2D;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import maps.osm.OSMMap;
 
@@ -13,60 +14,68 @@ import rescuecore2.misc.collections.LazyMap;
    This class holds all temporary information during map conversion.
 */
 public class TemporaryMap {
-    /**
-       The threshold for determining if nodes are co-located in metres.
-    */
-    private static final double NEARBY_THRESHOLD_M = 1;
+    /** The threshold for determining if nodes are co-located in metres. */
+    private static final double NEARBY_THRESHOLD_M = 0.01;
+    private final double threshold;
 
-    private double threshold;
+    private final Set<Node> nodes;
+    private final Set<Edge> edges;
+    private final Map<Node, Set<Edge>> edgesAtNode;
+    private final Map<Edge, Set<TemporaryObject>> objectsAtEdge;
+    private final Set<TemporaryRoad> tempRoads;
+    private final Set<TemporaryIntersection> tempIntersections;
+    private final Set<TemporaryBuilding> tempBuildings;
+    private final Set<TemporaryObject> allObjects;
 
-    private Set<Node> nodes;
-    private Set<Edge> edges;
-    private Map<Node, Set<Edge>> edgesAtNode;
-    private Map<Edge, Set<TemporaryObject>> objectsAtEdge;
-    private Set<TemporaryRoad> tempRoads;
-    private Set<TemporaryIntersection> tempIntersections;
-    private Set<TemporaryBuilding> tempBuildings;
-    private Set<TemporaryObject> allObjects;
-
-    private OSMMap osmMap;
-    private Collection<OSMIntersectionInfo> osmIntersections;
-    private Collection<OSMRoadInfo> osmRoads;
-    private Collection<OSMBuildingInfo> osmBuildings;
+    private final OSMMap osmMap;
+    private final Set<OSMIntersectionInfo> osmIntersections;
+    private final Set<OSMRoadInfo> osmRoads;
+    private final Set<OSMBuildingInfo> osmBuildings;
 
     private int nextID;
 
     private Rectangle2D cachedBounds;
 
-    private Map<OSMRoadInfo, OSMIntersectionInfo> roadStarts;
-    private Map<OSMRoadInfo, OSMIntersectionInfo> roadEnds;
+    private final double gridSpacing; // size of 1 meter in map coordinates
+    private final double gridOriginX; // map center X (grid anchor)
+    private final double gridOriginY; // map center Y (grid anchor)
+    private final Map<Long, Node> nodeGrid;
 
     /**
        Construct a TemporaryMap.
        @param osmMap The OpenStreetMap data this map is generated from.
     */
     public TemporaryMap(OSMMap osmMap) {
-        this.osmMap = osmMap;
+        this.osmMap           = osmMap;
+        this.osmIntersections = new LinkedHashSet<>();
+        this.osmRoads         = new LinkedHashSet<>();
+        this.osmBuildings     = new LinkedHashSet<>();
+
         nextID = 0;
-        nodes = new HashSet<Node>();
-        edges = new HashSet<Edge>();
+        nodes = new LinkedHashSet<>();
+        edges = new LinkedHashSet<>();
         threshold = ConvertTools.nearbyThreshold(osmMap, NEARBY_THRESHOLD_M);
-        tempRoads = new HashSet<TemporaryRoad>();
-        tempIntersections = new HashSet<TemporaryIntersection>();
-        tempBuildings = new HashSet<TemporaryBuilding>();
-        allObjects = new HashSet<TemporaryObject>();
-        edgesAtNode = new LazyMap<Node, Set<Edge>>() {
+        tempRoads = new LinkedHashSet<>();
+        tempIntersections = new LinkedHashSet<>();
+        tempBuildings = new LinkedHashSet<>();
+        allObjects = new LinkedHashSet<>();
+        edgesAtNode = new LazyMap<>() {
             @Override
             public Set<Edge> createValue() {
-                return new HashSet<Edge>();
+                return new LinkedHashSet<>();
             }
         };
-        objectsAtEdge = new LazyMap<Edge, Set<TemporaryObject>>() {
+        objectsAtEdge = new LazyMap<>() {
             @Override
             public Set<TemporaryObject> createValue() {
-                return new HashSet<TemporaryObject>();
+                return new LinkedHashSet<>();
             }
         };
+
+        this.gridSpacing = ConvertTools.sizeOf1Metre(osmMap);
+        this.gridOriginX = osmMap.getCenterLatitude();
+        this.gridOriginY = osmMap.getCenterLongitude();
+        this.nodeGrid    = new LinkedHashMap<>();
     }
 
     /**
@@ -77,39 +86,60 @@ public class TemporaryMap {
         return osmMap;
     }
 
-    /**
-     * Set the core OSM graph information (intersections, roads, buildings).
-     * This method is the single source of truth for updating the map's graph structure.
-     * It automatically rebuilds the internal road-to-intersection mappings to ensure data.
-     * @param intersections The new collection of intersections.
-     * @param roads         The new collection of roads.
-     * @param buildings     The new collection of buildings.
-     */
-    public void setOSMInfo(Collection<OSMIntersectionInfo> intersections, Collection<OSMRoadInfo> roads, Collection<OSMBuildingInfo> buildings) {
-        osmIntersections = new HashSet<>(intersections);
-        osmRoads = new HashSet<>(roads);
-        osmBuildings = new HashSet<>(buildings);
+    public void addOSMIntersection(final OSMIntersectionInfo intersection) {
+        osmIntersections.add(intersection);
+    }
 
-        Map<OSMNode, OSMIntersectionInfo> nodeToIntersection = new HashMap<>();
-        for (OSMIntersectionInfo i : osmIntersections) {
-            nodeToIntersection.put(i.getUnderlyingNode(), i);
-        }
+    public void removeOSMIntersection(final OSMIntersectionInfo intersection) {
+        osmIntersections.remove(intersection);
+    }
 
-        Map<OSMRoadInfo, OSMIntersectionInfo> roadStarts = new HashMap<>();
-        Map<OSMRoadInfo, OSMIntersectionInfo> roadEnds = new HashMap<>();
-        for (OSMRoadInfo road : osmRoads) {
-            roadStarts.put(road, nodeToIntersection.get(road.getFrom()));
-            roadEnds.put(road, nodeToIntersection.get(road.getTo()));
-        }
-        this.roadStarts = roadStarts;
-        this.roadEnds = roadEnds;
+    public void addOSMRoad(final OSMRoadInfo road) {
+        final OSMIntersectionInfo from = getOSMIntersection(road.getStart());
+        final OSMIntersectionInfo to = getOSMIntersection(road.getEnd());
+        osmRoads.add(road);
+        from.addRoad(road);
+        to.addRoad(road);
+    }
+
+    public void removeOSMRoad(final OSMRoadInfo road) {
+        final OSMIntersectionInfo from = getOSMIntersection(road.getStart());
+        final OSMIntersectionInfo to = getOSMIntersection(road.getEnd());
+        osmRoads.remove(road);
+        from.removeRoad(road);
+        to.removeRoad(road);
+    }
+
+    public void addOSMBuilding(final OSMBuildingInfo osmBuildingInfo) {
+        osmBuildings.add(osmBuildingInfo);
+    }
+
+    public Set<OSMRoadInfo> getConnectedOSMRoads(final OSMIntersectionInfo intersection) {
+        return getOSMRoadsContaining(intersection.getNode());
+    }
+
+    public Set<OSMRoadInfo> getOSMRoadsContaining(final OSMNode node) {
+        return osmRoads.stream()
+                .filter(road -> road.contains(node))
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    public OSMIntersectionInfo getOSMIntersection(final OSMNode node) {
+        return osmIntersections.stream()
+                .filter(intersection -> intersection.getNode().equals(node))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    public int getOSMIntersectionDegree(final OSMIntersectionInfo intersection) {
+        return getConnectedOSMRoads(intersection).size();
     }
 
     /**
        Get the OSM intersection info.
        @return The OSM intersection info.
     */
-    public Collection<OSMIntersectionInfo> getOSMIntersectionInfo() {
+    public Collection<OSMIntersectionInfo> getOSMIntersections() {
         return Collections.unmodifiableCollection(osmIntersections);
     }
 
@@ -117,7 +147,7 @@ public class TemporaryMap {
        Get the OSM road info.
        @return The OSM road info.
     */
-    public Collection<OSMRoadInfo> getOSMRoadInfo() {
+    public Collection<OSMRoadInfo> getOSMRoads() {
         return Collections.unmodifiableCollection(osmRoads);
     }
 
@@ -125,26 +155,8 @@ public class TemporaryMap {
        Get the OSM building info.
        @return The OSM building info.
     */
-    public Collection<OSMBuildingInfo> getOSMBuildingInfo() {
+    public Collection<OSMBuildingInfo> getOSMBuildings() {
         return Collections.unmodifiableCollection(osmBuildings);
-    }
-
-    /**
-     * Get the starting intersection for a given road segment.
-     * @param road The road segment to look up.
-     * @return The starting OSMIntersectionInfo.
-     */
-    public OSMIntersectionInfo getRoadStartIntersection(OSMRoadInfo road) {
-        return roadStarts.get(road);
-    }
-
-    /**
-     * Get the ending intersection for a given road segment.
-     * @param road The road segment to look up.
-     * @return The ending OSMIntersectionInfo.
-     */
-    public OSMIntersectionInfo getRoadEndIntersection(OSMRoadInfo road) {
-        return roadEnds.get(road);
     }
 
     /**
@@ -238,7 +250,7 @@ public class TemporaryMap {
        @return All roads.
     */
     public Collection<TemporaryRoad> getRoads() {
-        return new HashSet<TemporaryRoad>(tempRoads);
+        return Collections.unmodifiableSet(tempRoads);
     }
 
     /**
@@ -246,7 +258,7 @@ public class TemporaryMap {
        @return All intersections.
     */
     public Collection<TemporaryIntersection> getIntersections() {
-        return new HashSet<TemporaryIntersection>(tempIntersections);
+        return Collections.unmodifiableSet(tempIntersections);
     }
 
     /**
@@ -254,7 +266,7 @@ public class TemporaryMap {
        @return All buildings.
     */
     public Collection<TemporaryBuilding> getBuildings() {
-        return new HashSet<TemporaryBuilding>(tempBuildings);
+        return Collections.unmodifiableSet(tempBuildings);
     }
 
     /**
@@ -262,7 +274,7 @@ public class TemporaryMap {
      * @return All passable shapes.
      */
     public Collection<TemporaryObject> getAllPassableShapes() {
-        List<TemporaryObject> passable = new ArrayList<>();
+        final List<TemporaryObject> passable = new ArrayList<>();
         passable.addAll(tempRoads);
         passable.addAll(tempIntersections);
         return passable;
@@ -273,7 +285,7 @@ public class TemporaryMap {
        @return All objects.
     */
     public Collection<TemporaryObject> getAllObjects() {
-        return new HashSet<TemporaryObject>(allObjects);
+        return Collections.unmodifiableSet(allObjects);
     }
 
     /**
@@ -281,7 +293,7 @@ public class TemporaryMap {
        @return All nodes.
     */
     public Collection<Node> getAllNodes() {
-        return new HashSet<Node>(nodes);
+        return Collections.unmodifiableSet(nodes);
     }
 
     /**
@@ -289,16 +301,25 @@ public class TemporaryMap {
        @return All edges.
     */
     public Collection<Edge> getAllEdges() {
-        return new HashSet<Edge>(edges);
+        return Collections.unmodifiableSet(edges);
     }
 
     /**
-       Get all objects attached to an Edge.
-       @param e The Edge.
-       @return All attached TemporaryObjects.
-    */
+     * Get all objects attached to the specified edge.
+     * @param e The edge.
+     * @return An unmodifiable set of objects attached to the edge.
+     */
     public Set<TemporaryObject> getAttachedObjects(Edge e) {
-        return new HashSet<TemporaryObject>(objectsAtEdge.get(e));
+        return Collections.unmodifiableSet(objectsAtEdge.get(e));
+    }
+
+    /**
+     * Get all objects attached to the specified directed edge.
+     * @param e The directed edge.
+     * @return An unmodifiable set of objects attached to the underlying edge.
+     */
+    public Set<TemporaryObject> getAttachedObjects(DirectedEdge e) {
+        return getAttachedObjects(e.getEdge());
     }
 
     /**
@@ -307,15 +328,7 @@ public class TemporaryMap {
        @return All attached edges.
     */
     public Set<Edge> getAttachedEdges(Node n) {
-        return new HashSet<Edge>(edgesAtNode.get(n));
-    }
-
-    /**
-       Set the threshold for deciding if two points are the same. The {@link #isNear(Point2D, Point2D)} method uses this value to check if a new point needs to be registered.
-       @param t The new threshold.
-    */
-    public void setNearbyThreshold(double t) {
-        threshold = t;
+        return Collections.unmodifiableSet(edgesAtNode.get(n));
     }
 
     /**
@@ -354,39 +367,107 @@ public class TemporaryMap {
     }
 
     /**
-       Get a Node near a point. If a Node already exists nearby then it will be returned, otherwise a new Node will be created.
-       @param p The node coordinates.
-       @return A Node.
-    */
-    public Node getNode(Point2D p) {
-        return getNode(p.getX(), p.getY());
+     * Returns the node at the specified location.
+     *
+     * @param point the node location
+     * @return the node at the specified location
+     * @see #getNode(double, double)
+     */
+    public Node getNode(Point2D point) {
+        return getNode(point.getX(), point.getY());
     }
 
     /**
-       Get a Node near a point. If a Node already exists nearby then it will be returned, otherwise a new Node will be created.
-       @param x The X coordinate.
-       @param y The Y coordinate.
-       @return A Node.
-    */
+     * Returns the node at the specified location, creating it if necessary.
+     *
+     * @param x the x coordinate
+     * @param y the y coordinate
+     * @return the existing or newly created node
+     */
     public Node getNode(double x, double y) {
-        for (Node next : nodes) {
-            if (isNear(x, y, next.getX(), next.getY())) {
-                return next;
-            }
-        }
-        return createNode(x, y);
+        long ix = Math.round((x - gridOriginX) / gridSpacing);
+        long iy = Math.round((y - gridOriginY) / gridSpacing);
+        long key = gridKey(ix, iy);
+
+        // Return the existing node for this grid cell if one exists.
+        Node existing = nodeGrid.get(key);
+        if (existing != null) return existing;
+
+        // No node exists yet; create one at the grid-center coordinates.
+       double cx = gridOriginX + ix * gridSpacing;
+       double cy = gridOriginY + iy * gridSpacing;
+       return createAndRegisterNode(cx, cy);
     }
 
     /**
-       Get an Edge between two nodes. This will return either a new Edge or a shared instance if one already exists.
-       @param from The from node.
-       @param to The to node.
-       @return An Edge.
-    */
-    public Edge getEdge(Node from, Node to) {
-        for (Edge next : edges) {
+     * Returns whether this map contains the specified node.
+     *
+     * @param node the node to check
+     * @return {@code true} if this map contains the specified node;
+     *         {@code false} otherwise
+     */
+    @SuppressWarnings("unused")
+    public boolean containsNode(Node node) {
+        return containsNode(node.getX(), node.getY());
+    }
+
+    /**
+     * Returns whether this map contains a node at the specified location.
+     *
+     * @param point the location to check
+     * @return {@code true} if this map contains a node at the specified location;
+     *         {@code false} otherwise
+     */
+    public boolean containsNode(Point2D point) {
+        return containsNode(point.getX(), point.getY());
+    }
+
+    /**
+     * Returns whether this map contains a node at the specified location.
+     *
+     * @param x the x coordinate
+     * @param y the y coordinate
+     * @return {@code true} if this map contains a node at the specified location;
+     *         {@code false} otherwise
+     */
+    public boolean containsNode(double x, double y) {
+        long ix = Math.round((x - gridOriginX) / gridSpacing);
+        long iy = Math.round((y - gridOriginY) / gridSpacing);
+        long key = gridKey(ix, iy);
+
+        return nodeGrid.containsKey(key);
+    }
+
+    // Encode a 2D grid index as a single long key.
+    private static long gridKey(final long ix, final long iy) {
+        return (ix << 32) | (iy & 0xFFFFFFFFL);
+    }
+
+    // Create a new node at (x, y), register it in both the node set and the grid index.
+    private Node createAndRegisterNode(final double x, final double y) {
+        final Node node = new Node(nextID++, x, y);
+        nodes.add(node);
+
+        final long ix = Math.round((x - gridOriginX) / gridSpacing);
+        final long iy = Math.round((y - gridOriginY) / gridSpacing);
+        final long key = gridKey(ix, iy);
+        nodeGrid.put(key, node);
+
+        invalidateBoundsCache();
+
+        return node;
+    }
+
+    /**
+     * Get the edge connecting two nodes, creating it if necessary.
+     * @param from One end of the edge.
+     * @param to   The other end of the edge.
+     * @return The existing or newly created edge.
+     */
+    public Edge getEdge(final Node from, final Node to) {
+        for (final Edge next : edges) {
             if (next.getStart().equals(from) && next.getEnd().equals(to)
-                || next.getStart().equals(to) && next.getEnd().equals(from)) {
+             || next.getStart().equals(to)   && next.getEnd().equals(from)) {
                 return next;
             }
         }
@@ -394,13 +475,44 @@ public class TemporaryMap {
     }
 
     /**
-       Get a DirectedEdge between two nodes.
-       @param from The from node.
-       @param to The to node.
-       @return A new DirectedEdge.
-    */
-    public DirectedEdge getDirectedEdge(Node from, Node to) {
-        Edge e = getEdge(from, to);
+     * Returns whether this map contains the specified edge.
+     *
+     * @param edge the edge to check
+     * @return {@code true} if this map contains the specified edge;
+     *         {@code false} otherwise
+     */
+    public boolean containsEdge(Edge edge) {
+        return edges.contains(edge);
+    }
+
+    /**
+     * Returns whether this map contains an edge connecting the specified nodes,
+     * regardless of its direction.
+     *
+     * @param node1 one endpoint of the edge
+     * @param node2 the other endpoint of the edge
+     * @return {@code true} if this map contains an edge connecting the specified
+     *         nodes; {@code false} otherwise
+     */
+    public boolean containsEdge(Node node1, Node node2) {
+        for (Edge edge : edges) {
+            if (edge.getStart().equals(node1) && edge.getEnd().equals(node2) ||
+                edge.getStart().equals(node2) && edge.getEnd().equals(node1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Get a directed edge from one node to another.
+     * @param from The start node.
+     * @param to   The end node.
+     * @return     The directed edge, or {@code null} if both nodes are the same.
+     */
+    public DirectedEdge getDirectedEdge(final Node from, final Node to) {
+        if (from.equals(to)) return null;
+        final Edge e = getEdge(from, to);
         return new DirectedEdge(e, from);
     }
 
@@ -420,17 +532,18 @@ public class TemporaryMap {
     }
 
     /**
-       Split an edge into chunks.
-       @param edge The edge to split.
-       @param splitPoints The points to split the line. These must be in order along the line.
-       @return The replacement edges.
-    */
-    public List<Edge> splitEdge(Edge edge, Node... splitPoints) {
-        List<Edge> replacements = new ArrayList<Edge>();
+     * Split an edge into chunks.
+     * @param edge        The edge to split.
+     * @param splitPoints The nodes at which to split the edge.
+     * @return The list of replacement edges created by the split, or an empty list if no split occurred.
+     */
+    public List<Edge> splitEdge(final Edge edge, final Collection<Node> splitPoints) {
+        final List<Node> sorted = ConvertTools.sortedAlongEdge(edge, splitPoints);
+
+        final List<Edge> replacements = new ArrayList<>();
         Edge current = edge;
-        for (Node n : splitPoints) {
+        for (final Node n :  sorted) {
             if (n.equals(current.getStart()) || n.equals(current.getEnd())) {
-                // Don't bother if the split point is at the origin or endpoint
                 continue;
             }
             replacements.add(getEdge(current.getStart(), n));
@@ -444,17 +557,18 @@ public class TemporaryMap {
         }
 
         invalidateBoundsCache();
-
-        return replacements;
+        return Collections.unmodifiableList(replacements);
     }
 
-    private Node createNode(double x, double y) {
-        Node result = new Node(nextID++, x, y);
-        nodes.add(result);
-
-        invalidateBoundsCache();
-
-        return result;
+    /**
+     * Split an edge into chunks.
+     * @param edge        The edge to split.
+     * @param splitPoints The nodes at which to split the edge.
+     * @return The list of replacement edges created by the split, or an empty list if no split occurred.
+     * @see #splitEdge(Edge, Collection)
+     */
+    public List<Edge> splitEdge(Edge edge, Node... splitPoints) {
+        return splitEdge(edge, Arrays.asList(splitPoints));
     }
 
     private Edge createEdge(Node from, Node to) {
@@ -473,13 +587,6 @@ public class TemporaryMap {
         }
     }
 
-    private void removeNode(Node n) {
-        nodes.remove(n);
-        edgesAtNode.remove(n);
-
-        invalidateBoundsCache();
-    }
-
     private void removeEdge(Edge e) {
         edges.remove(e);
         edgesAtNode.get(e.getStart()).remove(e);
@@ -495,28 +602,47 @@ public class TemporaryMap {
         }
     }
 
+    /**
+     * Returns the bounding rectangle of all nodes in the map.
+     *
+     * <p>
+     * The result is cached after the first call. Call {@link #invalidateBoundsCache()}
+     * whenever nodes are added or removed to ensure the cached value is refreshed.
+     *
+     * <p>
+     * Width and height are guaranteed to be at least 1 meter, so that
+     * {@link SpatialGrid} never receives an empty rectangle and falls back to
+     * its dummy (no-op) mode.
+     *
+     * @return The bounding rectangle, or an empty {@link Rectangle2D} if the map has no nodes.
+     */
     public Rectangle2D getBounds() {
         if (this.cachedBounds != null) {
             return this.cachedBounds;
         }
 
-        Collection<Node> allNodes = getAllNodes();
+        final Collection<Node> allNodes = getAllNodes();
         if (allNodes.isEmpty()) {
             this.cachedBounds = new Rectangle2D.Double();
             return this.cachedBounds;
         }
 
         double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
-        double maxX = Double.MIN_VALUE, maxY = Double.MIN_VALUE;
+        double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
 
-        for (Node node : allNodes) {
+        for (final Node node : allNodes) {
             minX = Math.min(minX, node.getX());
             minY = Math.min(minY, node.getY());
             maxX = Math.max(maxX, node.getX());
             maxY = Math.max(maxY, node.getY());
         }
 
-        this.cachedBounds = new Rectangle2D.Double(minX, minY, maxX - minX, maxY - minY);
+        // Ensure with and height are least 1 meter so that SpatialGrid never
+        // receives an empty rectangle and fall back to its dummy (no-op) mode.
+        this.cachedBounds = new Rectangle2D.Double(
+                minX, minY,
+                Math.max(maxX - minX, 1.0),
+                Math.max(maxY - minY, 1.0));
         return this.cachedBounds;
     }
 

@@ -60,6 +60,14 @@ public class Line2D implements Indexable {
     }
 
     /**
+       Get the midpoint of this line segment.
+       @return A new {@link Point2D} representing the center of the line segment.
+     */
+    public Point2D getMidpoint() {
+        return getPoint(0.5);
+    }
+
+    /**
        Get the origin of this line segment.
        @return The origin.
     */
@@ -81,6 +89,14 @@ public class Line2D implements Indexable {
     */
     public Vector2D getDirection() {
         return direction;
+    }
+
+    /**
+       Get the length of this line segment.
+       @return The length of the line segment.
+     */
+    public double getLength() {
+        return direction.getLength();
     }
 
     @Override
@@ -109,6 +125,19 @@ public class Line2D implements Indexable {
         return t / d;
     }
 
+    /**
+       Determines whether this line is geometrically equivalent to another line.
+       @param other The line to compare.
+       @return {@code true} if both lines have the same endpoints, regardless of direction;
+               {@code false} otherwise.
+     */
+    public boolean isGeometricallyEquivalent(Line2D other) {
+        if (other == null) return false;
+        boolean sameDirection = this.origin.equals(other.origin) && this.end.equals(other.end);
+        boolean reverseDirection = this.origin.equals(other.end) && this.end.equals(other.origin);
+        return sameDirection || reverseDirection;
+    }
+
     @Override
     public Region getBoundingRegion() {
         if (region == null) {
@@ -120,8 +149,8 @@ public class Line2D implements Indexable {
 	public void setEnd(Point2D end2) {
 		this.end = end2;
 		calculateDirection();
-
 	}
+
 	private void calculateDirection() {
 		this.direction = end.minus(origin);
 	}
